@@ -7,10 +7,63 @@ This representation enables exact computation of phases in ZX-calculus graphs
 without floating-point errors.
 """
 
+import os
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 from jax import Array, lax
+
+# Feature flags ported from session-2026-05-13 work onto PR #78. Only flags
+# that fit cleanly within exact_scalar.py are kept; terms.py-based flags
+# (lazy term_vals, split-coeffs prod, cust prod kernel) and the SpDn matmul
+# flag (which now lives inside evaluate.py on PR #78) are dropped here.
+_SCAN_BACKEND = os.environ.get("TSIM_EXACTSCALAR_SCAN", "")
+_SCAN_UNROLL = int(os.environ.get("TSIM_EXACTSCALAR_UNROLL", "1"))
+_EXACTSCALAR_CUST_KERNEL = os.environ.get(
+    "TSIM_EXACTSCALAR_CUST_KERNEL", "") in ("1", "true", "True")
+_EXACTSCALAR_CUST_MIN_G = int(os.environ.get("TSIM_EXACTSCALAR_CUST_MIN_G", "0"))
+if _EXACTSCALAR_CUST_KERNEL:
+    try:
+        from cust_jax import scalar_sum_along_axis_ffi as _cust_scalar_sum_ffi
+        _EXACTSCALAR_CUST_KERNEL_AVAILABLE = True
+    except Exception:
+        _EXACTSCALAR_CUST_KERNEL_AVAILABLE = False
+else:
+    _EXACTSCALAR_CUST_KERNEL_AVAILABLE = False
+
+# H2: c128 register-tiled sum kernel for ComplexScalarArray.sum.
+_C128_SUM_CUST_KERNEL = os.environ.get(
+    "TSIM_SCALAR_BACKEND_CUST_KERNEL", "1"
+) in ("1", "true", "True")
+_C128_SUM_CUST_MIN_G = int(os.environ.get("TSIM_SCALAR_BACKEND_CUST_MIN_G", "0"))
+if _C128_SUM_CUST_KERNEL:
+    try:
+        from cust_jax import scalar_sum_along_axis_c128_ffi as _cust_sum_c128_ffi
+        _C128_SUM_CUST_AVAILABLE = True
+    except Exception:
+        _C128_SUM_CUST_AVAILABLE = False
+else:
+    _C128_SUM_CUST_AVAILABLE = False
+
+
+def _cust_c128_sum_along_axis(value, axis):
+    """Dispatch ComplexScalarArray.sum to the c128 register-tiled CUDA kernel.
+
+    Kernel signature is (G, BATCH) c128 → (BATCH,) c128. We flatten the
+    non-G axes into BATCH at the FFI boundary and unflatten the result.
+    """
+    if axis < 0:
+        axis += value.ndim
+    val_t = jnp.moveaxis(value, axis, 0)  # (G, ...)
+    G = val_t.shape[0]
+    rest_shape = val_t.shape[1:]
+    batch = 1
+    for s in rest_shape:
+        batch *= int(s)
+    flat = val_t.reshape(G, batch).astype(jnp.complex128)
+    out = _cust_sum_c128_ffi(flat, BATCH=batch, G=G)
+    return out.reshape(rest_shape)
 
 _E4 = jnp.exp(1j * jnp.pi / 4)
 _E4D = jnp.exp(-1j * jnp.pi / 4)
@@ -89,19 +142,34 @@ def _scalar_to_complex(data: jax.Array) -> jax.Array:
     return data[..., 0] + data[..., 1] * _E4 + data[..., 2] * 1j + data[..., 3] * _E4D
 
 
-# lax.scan unroll factor in _reduce_along_scan. Higher unroll trades
-# compiled-body size for fewer kernel-launches. 16 avoids committing to
-# whatever `True` means in a future JAX.
-_SCAN_UNROLL = 16
+def _scalar_mul_with_power_split(
+    p1, a1, b1, c1, d1,
+    p2, a2, b2, c2, d2,
+):
+    """_scalar_mul + _reduce_power_coeffs_step on split (per-coordinate) coeffs.
+
+    Returns (p, a, b, c, d) — 5 scalars instead of (power, (..., 4)) tuple.
+    """
+    A = a1 * a2 + b1 * d2 - c1 * c2 + d1 * b2
+    B = a1 * b2 + b1 * a2 + c1 * d2 + d1 * c2
+    C = a1 * c2 + b1 * b2 + c1 * a2 - d1 * d2
+    D = a1 * d2 - b1 * c2 - c1 * b2 + d1 * a2
+    p = p1 + p2
+    all_even = ((A | B | C | D) & 1) == 0
+    any_nonzero = (A != 0) | (B != 0) | (C != 0) | (D != 0)
+    reducible = all_even & any_nonzero
+    A = jnp.where(reducible, A // 2, A)
+    B = jnp.where(reducible, B // 2, B)
+    C = jnp.where(reducible, C // 2, C)
+    D = jnp.where(reducible, D // 2, D)
+    p = jnp.where(reducible, p + 1, p)
+    return p, A, B, C, D
 
 
 def _reduce_along_scan(power, coeffs, op, axis):
-    """lax.scan-based reduction along ``axis`` returning only the final carry.
+    """lax.scan-based reduction along `axis`. O(N) depth, O(1) extra memory.
 
-    Equivalent to ``lax.associative_scan(op, ..., axis=axis)`` followed by
-    ``take(..., -1, axis=axis)``, but keeps a single (power, coeffs) carry
-    through the scan instead of materialising the full prefix tensor —
-    O(1) extra memory along the scan axis instead of O(N).
+    Used when TSIM_EXACTSCALAR_SCAN=scan. Default path uses lax.associative_scan.
     """
     if axis < 0:
         axis += power.ndim
@@ -114,7 +182,6 @@ def _reduce_along_scan(power, coeffs, op, axis):
         return op(carry, x), None
 
     (final_power, final_coeffs), _ = lax.scan(step, init, rest, unroll=_SCAN_UNROLL)
-
     # Final fixpoint pass. ``_scalar_add_with_power`` and
     # ``_scalar_mul_with_power`` each apply only one
     # ``_reduce_power_coeffs_step`` per call, so a sequential scan over N
@@ -135,6 +202,29 @@ def _reduce_along_scan(power, coeffs, op, axis):
         _fixpoint_cond, _fixpoint_body, init_state,
     )
     return final_power, final_coeffs
+
+
+
+def _cust_sum_along_axis(arr, axis):
+    """Dispatch sum to cust_jax's register-tiled CUDA kernel.
+
+    The kernel signature is (G, BATCH) + (G, BATCH, 4) → (BATCH,) + (BATCH, 4).
+    """
+    if axis < 0:
+        axis += arr.power.ndim
+    power_t = jnp.moveaxis(arr.power, axis, 0)
+    coeffs_t = jnp.moveaxis(arr.coeffs, axis, 0)
+    G = power_t.shape[0]
+    rest_shape = power_t.shape[1:]
+    batch = 1
+    for s in rest_shape:
+        batch *= int(s)
+    p_in = power_t.reshape(G, batch).astype(jnp.int32)
+    c_in = coeffs_t.reshape(G, batch, 4).astype(jnp.int32)
+    out_p, out_c = _cust_scalar_sum_ffi(p_in, c_in, BATCH=batch, G=G)
+    out_p = out_p.reshape(rest_shape)
+    out_c = out_c.reshape(rest_shape + (4,))
+    return ExactScalarArray(out_c, out_p)
 
 
 class ExactScalarArray(eqx.Module):
@@ -171,21 +261,24 @@ class ExactScalarArray(eqx.Module):
         return ExactScalarArray(new_coeffs, new_power)
 
     def sum(self, axis: int = -1) -> "ExactScalarArray":
-        """Sum elements along the specified axis using normalized pairwise adds.
-
-        Args:
-            axis: The axis along which to sum.
-
-        Returns:
-            ExactScalarArray with the sum computed along the axis.
-
-        """
+        """Sum elements along the specified axis using normalized pairwise adds."""
+        if _EXACTSCALAR_CUST_KERNEL_AVAILABLE and _SCAN_BACKEND == "scan":
+            ax = axis if axis >= 0 else axis + self.power.ndim
+            G_along = self.power.shape[ax]
+            if G_along >= _EXACTSCALAR_CUST_MIN_G:
+                return _cust_sum_along_axis(self, axis)
         if axis < 0:
             axis += self.power.ndim
-
-        result_power, result_coeffs = _reduce_along_scan(
-            self.power, self.coeffs, _scalar_add_with_power, axis,
+        if _SCAN_BACKEND == "scan":
+            result_power, result_coeffs = _reduce_along_scan(
+                self.power, self.coeffs, _scalar_add_with_power, axis,
+            )
+            return ExactScalarArray(result_coeffs, result_power)
+        scanned_power, scanned_coeffs = lax.associative_scan(
+            _scalar_add_with_power, (self.power, self.coeffs), axis=axis
         )
+        result_power = jnp.take(scanned_power, indices=-1, axis=axis)
+        result_coeffs = jnp.take(scanned_coeffs, indices=-1, axis=axis)
         return ExactScalarArray(result_coeffs, result_power)
 
     def prod(self, axis: int = -1) -> "ExactScalarArray":
@@ -210,9 +303,17 @@ class ExactScalarArray(eqx.Module):
             result_coeffs = result_coeffs.at[..., 0].set(1)
             return ExactScalarArray(result_coeffs)
 
-        result_power, result_coeffs = _reduce_along_scan(
-            self.power, self.coeffs, _scalar_mul_with_power, axis,
+        if _SCAN_BACKEND == "scan":
+            result_power, result_coeffs = _reduce_along_scan(
+                self.power, self.coeffs, _scalar_mul_with_power, axis,
+            )
+            return ExactScalarArray(result_coeffs, result_power)
+
+        scanned_power, scanned_coeffs = lax.associative_scan(
+            _scalar_mul_with_power, (self.power, self.coeffs), axis=axis
         )
+        result_power = jnp.take(scanned_power, indices=-1, axis=axis)
+        result_coeffs = jnp.take(scanned_coeffs, indices=-1, axis=axis)
         return ExactScalarArray(result_coeffs, result_power)
 
     def to_complex(self) -> jax.Array:
@@ -220,3 +321,49 @@ class ExactScalarArray(eqx.Module):
         c_val = _scalar_to_complex(self.coeffs)
         scale = jnp.pow(2.0, self.power)
         return c_val * scale
+
+
+class ComplexScalarArray(eqx.Module):
+    """complex128 scalar carrier with the same API surface as ExactScalarArray.
+
+    Trades exact dyadic-rational arithmetic for native complex128 ops. Skips
+    the (..., 4) coefficient layout entirely — values are stored as a single
+    complex128 array, so `prod` / `sum` reduce to `jnp.prod` / `jnp.sum`. No
+    power tracking; the 2^power factor is folded into the complex magnitude.
+
+    Intended drop-in for ExactScalarArray when TSIM_SCALAR_BACKEND=complex128.
+    Loses ~16 digits of precision per op (vs exact ESA), but eliminates the
+    split-coeffs path and the cust prod/sum kernels.
+    """
+
+    value: Array  # complex128, shape (...)
+
+    def __init__(self, value: Array):
+        self.value = value.astype(jnp.complex128)
+
+    @classmethod
+    def from_coeffs(cls, coeffs: Array, power: Array | None = None) -> "ComplexScalarArray":
+        val = _scalar_to_complex(coeffs.astype(jnp.float64))
+        if power is not None:
+            val = val * jnp.pow(2.0, power.astype(jnp.float64))
+        return cls(val)
+
+    def __mul__(self, other: "ComplexScalarArray") -> "ComplexScalarArray":
+        return ComplexScalarArray(self.value * other.value)
+
+    def sum(self, axis: int = -1) -> "ComplexScalarArray":
+        if _C128_SUM_CUST_AVAILABLE:
+            ax = axis if axis >= 0 else axis + self.value.ndim
+            G_along = self.value.shape[ax]
+            if G_along >= _C128_SUM_CUST_MIN_G:
+                return ComplexScalarArray(_cust_c128_sum_along_axis(self.value, axis))
+        return ComplexScalarArray(self.value.sum(axis=axis))
+
+    def prod(self, axis: int = -1) -> "ComplexScalarArray":
+        if self.value.shape[axis] == 0:
+            shp = self.value.shape[:axis] + self.value.shape[axis + 1:]
+            return ComplexScalarArray(jnp.ones(shp, dtype=jnp.complex128))
+        return ComplexScalarArray(self.value.prod(axis=axis))
+
+    def to_complex(self) -> jax.Array:
+        return self.value

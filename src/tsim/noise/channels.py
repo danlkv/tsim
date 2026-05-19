@@ -621,6 +621,36 @@ class ChannelSampler:
             data.append((p_fire, cond_cdf, xor_patterns))
         return data
 
+    def build_flat_error_matrix(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return (probs, signature) for the independent-Bernoulli error model.
+
+        Each (channel, non-identity outcome) becomes one Bernoulli error with
+        prob = channel.probs[o+1] and signature row = xor_patterns_c[o]. Matches
+        the `approximate_disjoint_errors=True` semantics cuStabilizer DEM sampling
+        uses; differs from `.sample()`'s per-channel exclusive-outcome model by
+        O(p^2) per channel per shot.
+
+        Returns:
+            probs: (n_errors,) float64
+            signature: (n_errors, num_f) uint8
+        """
+        out_probs: list[np.ndarray] = []
+        sig_list: list[np.ndarray] = []
+        sd_iter = iter(self._sparse_data)
+        for ch in self.channels:
+            probs = ch.probs.astype(np.float64)
+            p_fire = 1.0 - float(probs[0])
+            if p_fire <= 1e-15 or len(probs) <= 1:
+                continue
+            _p_fire, _cond_cdf, xor_pats = next(sd_iter)
+            out_probs.append(probs[1:].astype(np.float64, copy=False))
+            sig_list.append(xor_pats.astype(np.uint8, copy=False))
+        if not out_probs:
+            num_f = int(self.signature_matrix.shape[1])
+            return (np.zeros(0, dtype=np.float64),
+                    np.zeros((0, num_f), dtype=np.uint8))
+        return np.concatenate(out_probs), np.concatenate(sig_list, axis=0)
+
     def sample(self, num_samples: int = 1) -> np.ndarray:
         """Sample from all error channels and transform to new error basis.
 
