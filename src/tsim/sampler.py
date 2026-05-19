@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import time  # tsim-instrument-tmp
 import warnings
 from math import ceil
 from typing import TYPE_CHECKING, Literal, overload
@@ -17,6 +19,15 @@ from tsim.compile.pipeline import compile_program
 from tsim.core.graph import prepare_graph
 from tsim.core.types import CompiledComponent, CompiledProgram
 from tsim.noise.channels import ChannelSampler
+
+# tsim-instrument-tmp: NVTX import and probe — for nsys breakdown profiling
+try:
+    import cupy.cuda.nvtx as _nvtx
+    _have_nvtx = True
+except Exception:
+    _have_nvtx = False
+
+_CHANNEL_BACKEND = os.environ.get("TSIM_CHANNEL_SAMPLER", "")
 
 if TYPE_CHECKING:
     from jax import Array as PRNGKey
@@ -137,14 +148,25 @@ def sample_program(
         return jnp.zeros((batch_size, 0), dtype=jnp.bool_)
 
     if len(program.direct_f_indices) > 0:
+        if _have_nvtx:
+            _nvtx.RangePush(f"direct_bits[n={len(program.direct_f_indices)}]")
         direct_bits = (
             f_params[:, program.direct_f_indices].astype(jnp.bool_)
             ^ program.direct_flips
         )
+        # Force the gather to complete inside the range (it's async otherwise).
+        if _have_nvtx:
+            jax.block_until_ready(direct_bits)
+            _nvtx.RangePop()
         results.append(direct_bits)
 
-    for component in program.components:
+    for ci, component in enumerate(program.components):
+        if _have_nvtx:
+            _nvtx.RangePush(f"sample_component[{ci}]")
         samples, key, max_norm_deviation = sample_component(component, f_params, key)
+        if _have_nvtx:
+            jax.block_until_ready(samples)
+            _nvtx.RangePop()
         if np.isclose(max_norm_deviation, 1):
             raise ValueError(
                 "A vanishing marginal probability distributionwas encountered (normalization 0). "
@@ -159,9 +181,14 @@ def sample_program(
             )
         results.append(samples)
 
+    if _have_nvtx:
+        _nvtx.RangePush("concat_reindex")
     combined = jnp.concatenate(results, axis=1)
     if program.output_reindex is not None:
         combined = combined[:, program.output_reindex]
+    if _have_nvtx:
+        jax.block_until_ready(combined)
+        _nvtx.RangePop()
     return combined
 
 
@@ -219,6 +246,33 @@ class _CompiledSamplerBase:
         self._direct_contiguous = n_direct > 0 and np.array_equal(
             self._direct_f_indices, np.arange(n_direct)
         )
+
+    def _init_cust_channel_sampler(self, batch_size: int) -> None:
+        """Build a cuStabilizer BitMatrixSparseSampler for on-device channel sampling.
+
+        Approximates per-channel exclusive outcomes as independent Bernoulli draws
+        (the `approximate_disjoint_errors=True` semantics). Difference is O(p^2)
+        per channel per shot.
+        """
+        import cupy as cp
+        from cuquantum.stabilizer._options import Options
+        from cuquantum.stabilizer.dem_sampling import BitMatrixSparseSampler
+
+        probs_h, sig_h = self._channel_sampler.build_flat_error_matrix()
+        if probs_h.size == 0:
+            self._cust_sampler = None
+            self._cust_sampler_max_shots = 0
+            return
+        self._cust_sampler = BitMatrixSparseSampler(
+            cp.asarray(sig_h, dtype=cp.uint8),
+            cp.asarray(probs_h, dtype=cp.float64),
+            max_shots=int(batch_size),
+            package="cupy",
+            seed=int(np.random.default_rng().integers(0, 2**31)),
+            options=Options(device_id=0),
+        )
+        self._cust_sampler_max_shots = int(batch_size)
+        self._cust_sampler_rng = np.random.default_rng()
 
     def _peak_bytes_per_sample(self) -> int:
         """Estimate peak device memory per sample from compiled program structure."""
@@ -302,15 +356,77 @@ class _CompiledSamplerBase:
         batches: list[jax.Array] = []
         reference: np.ndarray | None = None
 
-        for _ in range(ceil(shots / batch_size)):
-            f_params_np = self._channel_sampler.sample(batch_size)
+        _t_start = time.perf_counter()  # tsim-instrument-tmp
+        _chan_acc = 0.0  # tsim-instrument-tmp
+        _prog_acc = 0.0  # tsim-instrument-tmp
 
-            if compute_reference and reference is None:
-                f_params_np[0] = 0
+        use_cust_chan = _CHANNEL_BACKEND == "cust"
+        if use_cust_chan:
+            if (not hasattr(self, "_cust_sampler")
+                    or self._cust_sampler is None
+                    or self._cust_sampler_max_shots < batch_size):
+                self._init_cust_channel_sampler(batch_size)
+            if self._cust_sampler is None:
+                use_cust_chan = False  # no errors at all → fall back
 
-            f_params = jnp.asarray(f_params_np)
+        for _batch_i in range(ceil(shots / batch_size)):
+            if _have_nvtx:  # tsim-instrument-tmp
+                _nvtx.RangePush(f"sample_iter[{_batch_i}]")  # tsim-instrument-tmp
+
+            _t_chan = time.perf_counter()  # tsim-instrument-tmp
+            if use_cust_chan:
+                import cupy as cp
+                if _have_nvtx:  # tsim-instrument-tmp
+                    _nvtx.RangePush("channel_sample")  # tsim-instrument-tmp
+                seed = int(self._cust_sampler_rng.integers(0, 2**31))
+                self._cust_sampler.sample(batch_size, seed=seed)
+                f_outc_cp = self._cust_sampler.get_outcomes(bit_packed=False)
+                f_outc_cp = f_outc_cp[:batch_size]
+                if compute_reference and reference is None:
+                    f_outc_cp[0] = 0
+                # cuStabilizer outcomes are bit-pack-padded along axis 1 (544
+                # bytes for a 532-wide matrix). JAX dlpack rejects non-trivial
+                # strides — make it contiguous.
+                f_outc_cp = cp.ascontiguousarray(f_outc_cp)
+                cp.cuda.get_current_stream().synchronize()
+                if _have_nvtx:  # tsim-instrument-tmp
+                    _nvtx.RangePop()  # tsim-instrument-tmp
+                    _nvtx.RangePush("dlpack")  # tsim-instrument-tmp
+                # Modern cupy + JAX both support the __dlpack__ protocol; pass
+                # the cupy array directly. Older .toDlpack() gives "dltensor"
+                # capsules that current JAX rejects.
+                f_params = jnp.from_dlpack(f_outc_cp)
+                jax.block_until_ready(f_params)  # tsim-instrument-tmp (timing sync)
+                if _have_nvtx:  # tsim-instrument-tmp
+                    _nvtx.RangePop()  # tsim-instrument-tmp
+            else:
+                if _have_nvtx:  # tsim-instrument-tmp
+                    _nvtx.RangePush("channel_sample")  # tsim-instrument-tmp
+                f_params_np = self._channel_sampler.sample(batch_size)
+                if _have_nvtx:  # tsim-instrument-tmp
+                    _nvtx.RangePop()  # tsim-instrument-tmp
+
+                if compute_reference and reference is None:
+                    f_params_np[0] = 0
+
+                if _have_nvtx:  # tsim-instrument-tmp
+                    _nvtx.RangePush("h2d")  # tsim-instrument-tmp
+                f_params = jnp.asarray(f_params_np)
+                jax.block_until_ready(f_params)  # tsim-instrument-tmp (timing sync)
+                if _have_nvtx:  # tsim-instrument-tmp
+                    _nvtx.RangePop()  # tsim-instrument-tmp
+            _chan_acc += time.perf_counter() - _t_chan  # tsim-instrument-tmp
+
             self._key, subkey = jax.random.split(self._key)
+
+            _t_prog = time.perf_counter()  # tsim-instrument-tmp
+            if _have_nvtx:  # tsim-instrument-tmp
+                _nvtx.RangePush("sample_program")  # tsim-instrument-tmp
             samples = sample_program(self._program, f_params, subkey)
+            jax.block_until_ready(samples)  # tsim-instrument-tmp (timing sync)
+            if _have_nvtx:  # tsim-instrument-tmp
+                _nvtx.RangePop()  # tsim-instrument-tmp
+            _prog_acc += time.perf_counter() - _t_prog  # tsim-instrument-tmp
 
             if compute_reference and reference is None:
                 reference = np.asarray(samples[0])
@@ -318,7 +434,31 @@ class _CompiledSamplerBase:
 
             batches.append(samples)
 
-        result = np.concatenate(batches)[:shots]
+            if _have_nvtx:  # tsim-instrument-tmp
+                _nvtx.RangePop()  # tsim-instrument-tmp
+
+        if _have_nvtx:  # tsim-instrument-tmp
+            _nvtx.RangePush("gpu_concat")  # tsim-instrument-tmp
+        # Concat on device first, then a single d2h into one numpy buffer. The
+        # prior np.concatenate(batches) triggered per-batch __array__ d2h + a
+        # second host-side memcpy into the concat output — for big bool tensors
+        # the host concat alone was ~1 s on star7 500k. Device concat folds
+        # everything into one PCIe transfer.
+        combined = batches[0] if len(batches) == 1 else jnp.concatenate(batches, axis=0)
+        jax.block_until_ready(combined)  # tsim-instrument-tmp (compute/d2h boundary sync)
+        # Compute wall ends here; d2h wall starts. perf_counter readings let the
+        # bench separate the two without nsys.
+        self._last_sample_compute_s = time.perf_counter() - _t_start  # tsim-instrument-tmp
+        _t_d2h = time.perf_counter()  # tsim-instrument-tmp
+        if _have_nvtx:  # tsim-instrument-tmp
+            _nvtx.RangePop()  # tsim-instrument-tmp
+            _nvtx.RangePush("d2h_concat")  # tsim-instrument-tmp
+        result = np.asarray(combined)[:shots]
+        if _have_nvtx:  # tsim-instrument-tmp
+            _nvtx.RangePop()  # tsim-instrument-tmp
+        self._last_sample_d2h_s = time.perf_counter() - _t_d2h  # tsim-instrument-tmp
+        self._last_channel_s = _chan_acc  # tsim-instrument-tmp
+        self._last_sample_program_s = _prog_acc  # tsim-instrument-tmp
 
         if compute_reference:
             assert reference is not None

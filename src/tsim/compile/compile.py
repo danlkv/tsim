@@ -10,6 +10,8 @@ from jax import Array
 from pyzx_param.graph.base import BaseGraph
 from pyzx_param.graph.scalar import DyadicNumber
 
+from tsim.utils.linalg import _CustCsr, build_params_csr
+
 
 class CompiledScalarGraphs(eqx.Module):
     """JAX-compatible compiled scalar graphs representation.
@@ -55,6 +57,17 @@ class CompiledScalarGraphs(eqx.Module):
     approximate_floatfactors: Array  # shape: (num_graphs,), dtype: complex64
     power2: Array  # shape: (num_graphs,), dtype: int32
     floatfactor: Array  # shape: (num_graphs, 4), dtype: int32
+
+    # Precomputed cust CSR/packed for each of the six param_bits arrays. None
+    # when cust_jax isn't importable, TSIM_GF2MM_BACKEND isn't a cust backend,
+    # or the term is too small (G·T < TSIM_GF2MM_MIN_GT). _matmul_gf2 dispatches
+    # to the cust kernel when the corresponding field is non-None.
+    a_param_csr: "_CustCsr | None" = eqx.field(static=True, default=None)
+    b_param_csr: "_CustCsr | None" = eqx.field(static=True, default=None)
+    c_param_csr_a: "_CustCsr | None" = eqx.field(static=True, default=None)
+    c_param_csr_b: "_CustCsr | None" = eqx.field(static=True, default=None)
+    d_param_csr_a: "_CustCsr | None" = eqx.field(static=True, default=None)
+    d_param_csr_b: "_CustCsr | None" = eqx.field(static=True, default=None)
 
 
 def compile_scalar_graphs(
@@ -298,4 +311,10 @@ def compile_scalar_graphs(
         approximate_floatfactors=approximate_floatfactors,
         power2=jnp.array(power2, dtype=jnp.int32),
         floatfactor=jnp.array(exact_floatfactor, dtype=jnp.int32),
+        a_param_csr=build_params_csr(np.asarray(a_param_bits, dtype=np.uint8)),
+        b_param_csr=build_params_csr(np.asarray(b_param_bits, dtype=np.uint8)),
+        c_param_csr_a=build_params_csr(np.asarray(c_param_bits_a, dtype=np.uint8)),
+        c_param_csr_b=build_params_csr(np.asarray(c_param_bits_b, dtype=np.uint8)),
+        d_param_csr_a=build_params_csr(np.asarray(d_param_bits_a, dtype=np.uint8)),
+        d_param_csr_b=build_params_csr(np.asarray(d_param_bits_b, dtype=np.uint8)),
     )

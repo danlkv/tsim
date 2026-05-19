@@ -1,6 +1,83 @@
 """Linear algebra utilities for GF(2) operations."""
 
+import os
+
 import numpy as np
+
+try:
+    from cust_jax import (
+        matmul_gf2_csr_ffi as _cust_matmul_gf2_csr_spsp,
+        matmul_gf2_csr_spdn_ffi as _cust_matmul_gf2_csr_spdn,
+        pack_params_transposed as _cust_pack_params_transposed,
+        pack_params_dense_packed as _cust_pack_params_dense_packed,
+        upload_static_csr as _cust_upload_static_csr,
+        upload_static_packed as _cust_upload_static_packed,
+    )
+    _CUST_AVAILABLE = True
+except Exception:
+    _CUST_AVAILABLE = False
+
+_CUST_BACKENDS = ("cust", "cust_spdn")
+_CUST_MIN_GT = int(os.environ.get("TSIM_GF2MM_MIN_GT", "0"))
+
+
+def _current_backend() -> str:
+    return os.environ.get("TSIM_GF2MM_BACKEND", "")
+
+
+class _CustCsr:
+    """Static side data uploaded to device at compile time.
+
+    Holds whichever representation the active backend needs (SpSp: rowoff/colidx;
+    SpDn: bit-packed). Hashed by identity so jit caches by instance.
+    """
+
+    __slots__ = ("backend", "rowoff_d", "colidx_d", "packed_d", "n_pad")
+
+    def __init__(self, backend, rowoff_d, colidx_d, packed_d, n_pad):
+        self.backend = backend
+        self.rowoff_d = rowoff_d
+        self.colidx_d = colidx_d
+        self.packed_d = packed_d
+        self.n_pad = n_pad
+
+    def __hash__(self):
+        return id(self)
+
+    def __eq__(self, other):
+        return self is other
+
+
+def _use_cust_backend() -> bool:
+    return _CUST_AVAILABLE and _current_backend() in _CUST_BACKENDS
+
+
+def build_params_csr(params):
+    """Compile-time helper: pack params^T and upload to device.
+
+    Returns None when cust_jax isn't importable, backend isn't a cust one,
+    params is empty along (G, T), or G·T is below TSIM_GF2MM_MIN_GT.
+    """
+    if not _CUST_AVAILABLE:
+        return None
+    if params.ndim != 3:
+        return None
+    G, T, _ = params.shape
+    if G * T == 0:
+        return None
+    if _CUST_MIN_GT > 0 and G * T < _CUST_MIN_GT:
+        return None
+    backend = _current_backend()
+    if backend not in _CUST_BACKENDS:
+        return None
+    params_u8 = np.asarray(params, dtype=np.uint8)
+    if backend == "cust":
+        rowoff_h, colidx_h, n_pad = _cust_pack_params_transposed(params_u8)
+        rowoff_d, colidx_d = _cust_upload_static_csr(rowoff_h, colidx_h)
+        return _CustCsr("cust", rowoff_d, colidx_d, None, n_pad)
+    packed_h, n_pad = _cust_pack_params_dense_packed(params_u8)
+    packed_d = _cust_upload_static_packed(packed_h)
+    return _CustCsr("cust_spdn", None, None, packed_d, n_pad)
 
 
 def find_basis(vectors: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
