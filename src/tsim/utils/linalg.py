@@ -155,15 +155,19 @@ def find_basis(vectors: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return vecs[basis_indices], transform
 
 
-def matmul_gf2(a: Array, b: Array) -> Array:
+def matmul_gf2(a: Array, b: Array, csr: "_CustCsr | None" = None) -> Array:
     """Compute binary dot products mod 2 as ``a_GTP x b_BP -> b_BGT``.
 
-    Uses float32 matmul (integer matmul does not have BLAS support on CPU)
-    then casts back to uint8.
+    Default path is float32 matmul cast to uint8 then mod 2 (integer matmul
+    does not have BLAS support on CPU). When ``csr`` is a precomputed
+    ``_CustCsr`` and ``TSIM_GF2MM_BACKEND`` selects a cust backend, routes
+    through cuStabilizer's SpSp/SpDn kernel via cust_jax. Output is
+    bit-exact in either case.
 
     Args:
         a: Parameter bit-masks, shape ``(G, T, P)`` — G graphs, T terms, P parameters.
         b: Binary parameter values, shape ``(B, P)`` — B batch elements.
+        csr: Optional precomputed CSR/packed view of ``a^T : (P, G·T_pad)``.
 
     Returns:
         Binary row-sums mod 2, shape ``(B, G, T)``.
@@ -172,6 +176,19 @@ def matmul_gf2(a: Array, b: Array) -> Array:
     G, T, _ = a.shape
     if G * T == 0:
         return jnp.zeros((b.shape[0], G, T), dtype=jnp.uint8)
+    if csr is not None and _use_cust_backend():
+        from cust_jax import matmul_gf2_csr_ffi, matmul_gf2_csr_spdn_ffi
+        P = int(a.shape[-1])
+        if csr.backend == "cust":
+            return matmul_gf2_csr_ffi(
+                b, B_rowoff_d=csr.rowoff_d, B_colidx_d=csr.colidx_d,
+                G=G, T=T, P=P, n_pad=csr.n_pad,
+            )
+        if csr.backend == "cust_spdn":
+            return matmul_gf2_csr_spdn_ffi(
+                b, B_packed_d=csr.packed_d,
+                G=G, T=T, P=P, n_pad=csr.n_pad,
+            )
     # NOTE: ``% 2`` must run on float32 — JAX's float→uint8 cast saturates at
     # 255 (it does not wrap mod 256), which would corrupt parity for inner
     # products with more than 255 set bits.

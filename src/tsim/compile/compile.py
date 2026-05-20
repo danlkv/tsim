@@ -16,6 +16,7 @@ from tsim.compile.terms import (
     PiProducts,
     ScalarPrefactor,
 )
+from tsim.utils.linalg import build_params_csr
 
 
 class CompiledScalarGraphs(eqx.Module):
@@ -82,6 +83,7 @@ def _compile_node_phases(
         phases=jnp.array(phases),
         params=jnp.array(params),
         counts=jnp.array(counts, dtype=jnp.int32),
+        params_csr=build_params_csr(params),
     )
 
 
@@ -140,7 +142,11 @@ def _compile_halfpi_phases(
             coeffs[i, j] = coeff
             params[i, j] = param_bit
 
-    return HalfPiPhases(coeffs=jnp.array(coeffs), params=jnp.array(params))
+    return HalfPiPhases(
+        coeffs=jnp.array(coeffs),
+        params=jnp.array(params),
+        params_csr=build_params_csr(params),
+    )
 
 
 def _compile_pi_products(
@@ -200,6 +206,8 @@ def _compile_pi_products(
         psi_params=jnp.array(psi_params_arr),
         phi_const=jnp.array(phi_const_arr),
         phi_params=jnp.array(phi_params_arr),
+        psi_csr=build_params_csr(psi_params_arr),
+        phi_csr=build_params_csr(phi_params_arr),
     )
 
 
@@ -265,6 +273,8 @@ def _compile_phase_pairs(
         beta=jnp.array(beta),
         beta_params=jnp.array(beta_params_arr),
         counts=jnp.array(counts, dtype=jnp.int32),
+        alpha_csr=build_params_csr(alpha_params_arr),
+        beta_csr=build_params_csr(beta_params_arr),
     )
 
 

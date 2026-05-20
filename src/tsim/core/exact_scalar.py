@@ -20,6 +20,12 @@ from jax import Array, lax
 # flag (which now lives inside evaluate.py on PR #78) are dropped here.
 _SCAN_BACKEND = os.environ.get("TSIM_EXACTSCALAR_SCAN", "")
 _SCAN_UNROLL = int(os.environ.get("TSIM_EXACTSCALAR_UNROLL", "1"))
+
+# H: complex128 scalar backend. When set, term modules return
+# ComplexScalarArray (single c128 array) instead of ExactScalarArray
+# (int32 dyadic coefficients + int32 power). Faster but precision-bounded;
+# breaks above ~G=32 for cutting / high-stab-rank circuits.
+_USE_COMPLEX128 = os.environ.get("TSIM_SCALAR_BACKEND", "") == "complex128"
 _EXACTSCALAR_CUST_KERNEL = os.environ.get(
     "TSIM_EXACTSCALAR_CUST_KERNEL", "") in ("1", "true", "True")
 _EXACTSCALAR_CUST_MIN_G = int(os.environ.get("TSIM_EXACTSCALAR_CUST_MIN_G", "0"))
@@ -367,3 +373,14 @@ class ComplexScalarArray(eqx.Module):
 
     def to_complex(self) -> jax.Array:
         return self.value
+
+
+def make_summands(coeffs: Array, power: Array | None = None):
+    """Wrap dyadic coefficients in the active scalar backend's array type.
+
+    Term modules call this to produce their `.evaluate(...)` return value so
+    the choice of ExactScalarArray vs ComplexScalarArray is centralized here.
+    """
+    if _USE_COMPLEX128:
+        return ComplexScalarArray.from_coeffs(coeffs, power)
+    return ExactScalarArray(coeffs) if power is None else ExactScalarArray(coeffs, power)

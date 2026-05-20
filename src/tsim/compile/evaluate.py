@@ -9,7 +9,11 @@ from jax import Array
 
 from tsim.compile.compile import CompiledScalarGraphs
 from tsim.compile.terms import UNIT_PHASES
-from tsim.core.exact_scalar import ExactScalarArray
+from tsim.core.exact_scalar import (
+    ExactScalarArray,
+    _USE_COMPLEX128,
+    make_summands,
+)
 
 
 @jax.jit
@@ -34,8 +38,8 @@ def evaluate(circuit: CompiledScalarGraphs, param_vals: Array) -> Array:
     if prefactor.phase_indices.shape[0] == 0:
         return jnp.zeros(param_vals.shape[0], dtype=jnp.complex64)
 
-    static_phases = ExactScalarArray(UNIT_PHASES[prefactor.phase_indices])
-    float_factor = ExactScalarArray(prefactor.floatfactor)
+    static_phases = make_summands(UNIT_PHASES[prefactor.phase_indices])
+    float_factor = make_summands(prefactor.floatfactor)
 
     total = functools.reduce(
         operator.mul,
@@ -50,6 +54,13 @@ def evaluate(circuit: CompiledScalarGraphs, param_vals: Array) -> Array:
     )
 
     if not prefactor.has_approximate_floatfactors:
+        if _USE_COMPLEX128:
+            # ComplexScalarArray has no power axis — fold 2^power2 at the
+            # boundary and sum per-batch over the (graph) axis.
+            return jnp.sum(
+                total.to_complex() * (2.0 ** prefactor.power2),
+                axis=-1,
+            )
         total = ExactScalarArray(total.coeffs, total.power + prefactor.power2)
         return total.sum().to_complex()
 
