@@ -522,34 +522,37 @@ class _CompiledSamplerBase:
                     # host post-d2h. Avoids the 8× unpack-on-device + the
                     # corresponding 8× d2h volume.
                     n_bytes = (n_direct + 7) // 8
-                    result_cp = f_outc_cp[:, :n_bytes]
-                    if _G_DIRECT_PACK == "packed":
-                        result_cp = cp.ascontiguousarray(result_cp)
+                    result_cp = cp.ascontiguousarray(f_outc_cp[:, :n_bytes])
                 elif self._direct_zero_copy:
-                    result_cp = f_outc_cp[:, :n_direct].view(cp.bool_)
-                    if _G_DIRECT_PACK == "contig":
-                        result_cp = cp.ascontiguousarray(result_cp)
+                    # The slice [:, :n_direct] is non-contiguous (stride =
+                    # padded width); make it contig before the d2h memcpy.
+                    result_cp = cp.ascontiguousarray(
+                        f_outc_cp[:, :n_direct].view(cp.bool_)
+                    )
                 else:
                     result_cp = f_outc_cp[:, self._direct_f_indices_cp] ^ self._direct_flips_cp
                     if self._direct_reindex_cp is not None:
                         result_cp = result_cp[:, self._direct_reindex_cp]
-                    result_cp = result_cp.view(cp.bool_)
-                    if _G_DIRECT_PACK == "contig":
-                        result_cp = cp.ascontiguousarray(result_cp)
+                    result_cp = cp.ascontiguousarray(result_cp.view(cp.bool_))
                 # Sync once at the compute/d2h boundary so the perf_counter
                 # split is honest.
                 cp.cuda.get_current_stream().synchronize()
         self._last_sample_compute_s = time.perf_counter() - _t
 
+        # d2h via cudaMemcpy into a cached pinned destination. cp.asnumpy
+        # would do the same transfer through a pageable host buffer, which
+        # collapses to ~2 GB/s (H100) / ~4 GB/s (B200) at large sizes — see
+        # bench-alternatives/d2h-bandwidth. With pinned: ~22 / ~51 GB/s.
+        # The pinned buffer aliases across sample() calls; callers that need
+        # to retain results past the next sample() should .copy() the return.
         _t_d2h = time.perf_counter()
         with _nvtx_range("d2h_direct"):
-            result = cp.asnumpy(result_cp)
+            result = self._d2h_into_pinned(result_cp)
         self._last_sample_d2h_s = time.perf_counter() - _t_d2h
 
         if use_packed:
             # Host-side bit-unpack: (shots, n_bytes) uint8 → (shots, n_direct)
-            # bool. np.unpackbits is ~1-2 GB/s and runs in parallel with future
-            # GPU work if any. We keep it inside the d2h time bucket so the
+            # bool. We keep the unpack inside the d2h time bucket so the
             # comparison is apples-to-apples (caller sees a bool array either
             # way).
             _t_unpack = time.perf_counter()
@@ -557,6 +560,44 @@ class _CompiledSamplerBase:
             result = unpacked[:, :n_direct].astype(np.bool_, copy=False)
             self._last_sample_d2h_s += time.perf_counter() - _t_unpack
         return result
+
+    def _d2h_into_pinned(self, src_cp):
+        """cudaMemcpy a contiguous device cupy array into a cached pinned host buffer.
+
+        Returns an ndarray view of the pinned buffer with src_cp's dtype +
+        shape. The buffer is allocated once via cp.cuda.alloc_pinned_memory
+        and reused (resized only if a later call needs more bytes); the
+        returned ndarray's lifetime is tied to the cached PinnedMemoryPointer.
+        """
+        import cupy as cp
+        from cuda.bindings import runtime as cudart
+
+        nbytes = int(src_cp.nbytes)
+        if (not hasattr(self, "_pinned_mem")
+                or self._pinned_mem is None
+                or self._pinned_nbytes < nbytes):
+            # Grow (or initialise). PinnedMemoryPointer is cleaned up when
+            # the previous reference drops.
+            self._pinned_mem = cp.cuda.alloc_pinned_memory(nbytes)
+            self._pinned_nbytes = nbytes
+            self._pinned_buf = np.frombuffer(self._pinned_mem, dtype=np.uint8)
+
+        # Slice the destination to the exact byte count for this transfer.
+        dst_bytes = self._pinned_buf[:nbytes]
+        err = cudart.cudaMemcpy(
+            dst_bytes.ctypes.data,
+            int(src_cp.data.ptr),
+            nbytes,
+            cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost,
+        )[0]
+        if err != cudart.cudaError_t.cudaSuccess:
+            msg = cudart.cudaGetErrorString(err)[1].decode()
+            raise RuntimeError(f"cudaMemcpy d2h failed: {msg}")
+
+        # Reinterpret as src_cp's dtype + shape, then return that view of
+        # the pinned region.
+        out = dst_bytes.view(np.dtype(src_cp.dtype)).reshape(src_cp.shape)
+        return out
 
     def __repr__(self) -> str:
         """Return a string representation with compilation statistics."""
